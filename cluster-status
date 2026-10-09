@@ -1,0 +1,699 @@
+#!/usr/bin/env python3
+"""Fairshare / usage / queue tracker for SLURM clusters reachable over ssh.
+
+Single ssh round-trip per cluster (squeue + sshare + sreport bundled into one
+remote script), so a check is fast enough to re-run on a watch loop.
+"""
+
+import argparse
+import concurrent.futures
+import html as html_lib
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+# Edit these to your own ssh hosts and SLURM accounts (or override per-run
+# with --clusters / --accounts). Hosts must be reachable as `ssh <host>`
+# (set up an entry in ~/.ssh/config if the real hostname differs).
+DEFAULT_CLUSTERS = ["cluster1", "cluster2"]
+DEFAULT_ACCOUNTS = ["myaccount_cpu", "myaccount_gpu"]
+SSH_TIMEOUT = 25
+
+HISTORY_FILE = Path.home() / ".local" / "state" / "cluster-status" / "history.csv"
+MAX_HISTORY_LINES = 5000
+BLOCKS = "▁▂▃▄▅▆▇█"
+
+REMOTE_SCRIPT = r"""
+set -u
+ME=$(whoami)
+echo "===WHOAMI==="
+echo "$ME"
+echo "===SQUEUE==="
+squeue -u "$ME" -h -o '%i|%P|%T|%D|%C|%b|%a'
+echo "===RUNDETAIL==="
+squeue -u "$ME" -h -t RUNNING -o '%i|%a|%b|%M|%l|%S|%V' | while IFS='|' read -r jid acct gres used limit st sub; do
+  wait_s=NA
+  if [ -n "$st" ] && [ -n "$sub" ] && [ "$st" != "N/A" ] && [ "$sub" != "N/A" ]; then
+    st_s=$(date -d "$st" +%s 2>/dev/null)
+    sub_s=$(date -d "$sub" +%s 2>/dev/null)
+    [ -n "$st_s" ] && [ -n "$sub_s" ] && wait_s=$((st_s - sub_s))
+  fi
+  echo "$jid|$acct|$gres|$used|$limit|$wait_s"
+done
+echo "===SSHARE==="
+sshare -A {accounts} 2>/dev/null
+echo "===USAGE24H==="
+sreport -p cluster AccountUtilizationByUser Accounts={accounts} \
+  Start=$(date -d '24 hours ago' +%Y-%m-%dT%H:%M:%S) End=now -t Hours 2>/dev/null
+echo "===USAGE7D==="
+sreport -p cluster AccountUtilizationByUser Accounts={accounts} \
+  Start=$(date -d '7 days ago' +%Y-%m-%dT%H:%M:%S) End=now -t Hours 2>/dev/null
+echo "===PENDING==="
+squeue -u "$ME" -h -t PENDING --start -o '%i|%S|%R' | while IFS='|' read -r jid st reason; do
+  if [ -n "$st" ] && [ "$st" != "N/A" ]; then
+    st_s=$(date -d "$st" +%s 2>/dev/null) && now_s=$(date +%s) && \
+      echo "$jid|$((st_s - now_s))|$reason" || echo "$jid|NA|$reason"
+  else
+    echo "$jid|NA|$reason"
+  fi
+done
+echo "===END==="
+"""
+
+
+@dataclass
+class ClusterStatus:
+    name: str
+    ok: bool = True
+    error: str = ""
+    username: str = ""
+    running_by_account: dict = field(default_factory=dict)   # account -> {"jobs", "cpus", "gpus" (H100-equiv)}
+    running_jobs: list = field(default_factory=list)          # [{"jobid","account","gpu","elapsed","limit","wait"}]
+    pending_count: int = 0
+    pending_etas: list = field(default_factory=list)          # [(jobid, seconds_or_None, reason)]
+    fairshare: dict = field(default_factory=dict)             # account -> float
+    usage_24h: dict = field(default_factory=dict)             # account -> hours
+    usage_7d: dict = field(default_factory=dict)               # account -> hours
+
+
+_MIG_FRACTION_RE = re.compile(r"(\d+)g\.\d+gb")
+
+
+def _gpu_equiv(gres: str) -> float:
+    """Full-GPU-equivalent count: a MIG slice like 1g.10gb is 1/7 of an H100
+    (7 'g' units per chip), so it counts as 1/7, not 1."""
+    if not gres or gres == "N/A":
+        return 0.0
+    total = 0.0
+    for part in gres.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        tail = part.rsplit(":", 1)[-1].strip()
+        if not tail.isdigit():
+            continue
+        count = int(tail)
+        m = _MIG_FRACTION_RE.search(part)
+        fraction = int(m.group(1)) / 7 if m else 1.0
+        total += count * fraction
+    return total
+
+
+def _parse_duration(s: str) -> "int | None":
+    """SLURM duration string ('MM:SS', 'HH:MM:SS', 'D-HH:MM:SS', 'UNLIMITED') -> seconds."""
+    s = s.strip()
+    if not s or s.upper() in ("UNLIMITED", "NOT_SET", "N/A", "INVALID"):
+        return None
+    days = 0
+    if "-" in s:
+        d, s = s.split("-", 1)
+        try:
+            days = int(d)
+        except ValueError:
+            return None
+    try:
+        parts = [int(p) for p in s.split(":")]
+    except ValueError:
+        return None
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    h, m, sec = parts[-3:]
+    return days * 86400 + h * 3600 + m * 60 + sec
+
+
+def _section(blob: str, name: str) -> list:
+    pattern = rf"==={name}===\n(.*?)(?=\n===|\Z)"
+    m = re.search(pattern, blob, re.S)
+    if not m:
+        return []
+    return [ln for ln in m.group(1).splitlines() if ln.strip()]
+
+
+def fetch_cluster(host: str, accounts: list) -> ClusterStatus:
+    status = ClusterStatus(name=host)
+    script = REMOTE_SCRIPT.format(accounts=",".join(accounts))
+    try:
+        proc = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={SSH_TIMEOUT}", host, "bash -s"],
+            input=script,
+            capture_output=True,
+            text=True,
+            timeout=SSH_TIMEOUT + 10,
+        )
+    except subprocess.TimeoutExpired:
+        status.ok = False
+        status.error = "ssh timed out"
+        return status
+
+    out = proc.stdout
+    if "===WHOAMI===" not in out:
+        status.ok = False
+        status.error = (proc.stderr or "no output").strip().splitlines()[-1:] or ["unreachable"]
+        status.error = status.error[0] if isinstance(status.error, list) else status.error
+        return status
+
+    who = _section(out, "WHOAMI")
+    status.username = who[0].strip() if who else "?"
+
+    for line in _section(out, "SQUEUE"):
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 7:
+            continue
+        _, _, state, _, cpus, gres, account = parts[:7]
+        if state != "RUNNING":
+            continue
+        bucket = status.running_by_account.setdefault(account, {"jobs": 0, "cpus": 0, "gpus": 0.0})
+        bucket["jobs"] += 1
+        bucket["cpus"] += int(cpus) if cpus.isdigit() else 0
+        bucket["gpus"] += _gpu_equiv(gres)
+
+    for line in _section(out, "RUNDETAIL"):
+        parts = line.split("|")
+        if len(parts) != 6:
+            continue
+        jid, acct, gres, used, limit, wait_s = parts
+        try:
+            wait = int(wait_s)
+        except ValueError:
+            wait = None
+        status.running_jobs.append(
+            {
+                "jobid": jid,
+                "account": acct,
+                "gpu": _gpu_equiv(gres) > 0,
+                "elapsed": _parse_duration(used) or 0,
+                "limit": _parse_duration(limit),
+                "wait": wait,
+            }
+        )
+
+    for line in _section(out, "SSHARE"):
+        tok = line.split()
+        if len(tok) >= 7 and tok[1] == status.username:
+            try:
+                status.fairshare[tok[0]] = float(tok[-1])
+            except ValueError:
+                pass
+
+    for section, target in (("USAGE24H", status.usage_24h), ("USAGE7D", status.usage_7d)):
+        for line in _section(out, section):
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) >= 5 and parts[2] == status.username and parts[1] in accounts:
+                try:
+                    target[parts[1]] = float(parts[4])
+                except ValueError:
+                    pass
+
+    for line in _section(out, "PENDING"):
+        parts = line.split("|")
+        if len(parts) != 3:
+            continue
+        jid, secs, reason = parts
+        status.pending_count += 1
+        secs_val = int(secs) if secs.isdigit() or (secs.startswith("-") and secs[1:].isdigit()) else None
+        status.pending_etas.append((jid, secs_val, reason))
+
+    status.pending_etas.sort(key=lambda t: (t[1] is None, t[1] if t[1] is not None else 0))
+    return status
+
+
+def _fmt_eta(secs) -> str:
+    if secs is None:
+        return "?"
+    secs = max(secs, 0)
+    h, rem = divmod(secs, 3600)
+    m = rem // 60
+    return f"{h}h{m:02d}m" if h else f"{m}m"
+
+
+def _fmt_dur(secs) -> str:
+    if secs is None:
+        return "?"
+    secs = max(int(secs), 0)
+    d, rem = divmod(secs, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return f"{d}d{h:02d}h"
+    if h:
+        return f"{h}h{m:02d}m"
+    return f"{m}m"
+
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+
+CYAN = "\033[36m"
+GREEN = "\033[32m"
+PURPLE = "\033[35m"
+PINK = "\033[95m"
+ORANGE = "\033[33m"  # ANSI has no orange; yellow stands in for the "warn" tier
+RED = "\033[31m"
+GRAY = "\033[90m"
+FG = ""  # default foreground -- let the terminal's own theme show through
+
+
+def _fs_color(v: float) -> str:
+    if v >= 0.5:
+        return GREEN
+    if v >= 0.2:
+        return ORANGE
+    return RED
+
+
+def _eta_color(secs) -> str:
+    if secs is None:
+        return GRAY
+    if secs <= 3600:
+        return GREEN
+    if secs <= 6 * 3600:
+        return ORANGE
+    return GRAY
+
+
+def _progress_bar(frac: "float | None", width: int = 20) -> str:
+    if frac is None:
+        return f"{GRAY}{'░' * width}{RESET}"
+    frac = min(max(frac, 0.0), 1.0)
+    filled = int(round(frac * width))
+    color = GREEN if frac < 0.6 else ORANGE if frac < 0.85 else RED
+    return f"{color}{'█' * filled}{RESET}{GRAY}{'░' * (width - filled)}{RESET}"
+
+
+def _job_urgency(j: dict) -> float:
+    """Sort key: closest to its walltime limit first; unlimited jobs sort last."""
+    return j["elapsed"] / j["limit"] if j["limit"] else -1.0
+
+
+_ARRAY_TASK_RE = re.compile(r"^(\d+)_\d+(?:%\d+)?$")
+
+
+def _array_base(jobid: str) -> str:
+    m = _ARRAY_TASK_RE.match(jobid)
+    return m.group(1) if m else jobid
+
+
+def _group_running_jobs(jobs: list) -> list:
+    """Collapse same-array-job tasks into one row: the most urgent task in the
+    group stands in for the bar, tagged with how many tasks share its profile."""
+    groups: dict = {}
+    for j in jobs:
+        g = groups.setdefault(_array_base(j["jobid"]), {"base": _array_base(j["jobid"]), "count": 0, "worst": None})
+        g["count"] += 1
+        if g["worst"] is None or _job_urgency(j) > _job_urgency(g["worst"]):
+            g["worst"] = j
+    return list(groups.values())
+
+
+def _group_label(g: dict) -> str:
+    return g["worst"]["jobid"] if g["count"] == 1 else f"{g['base']}_* x{g['count']}"
+
+
+def _job_kind(j: dict) -> str:
+    return "GPU" if j["gpu"] else "CPU"
+
+
+def _grand_totals(statuses: list) -> tuple:
+    cpu = sum(b["cpus"] for st in statuses if st.ok for b in st.running_by_account.values())
+    gpu = sum(b["gpus"] for st in statuses if st.ok for b in st.running_by_account.values())
+    return cpu, gpu
+
+
+def _cluster_load(st: ClusterStatus) -> float:
+    """Running-job count, as a simple proxy for how heavily used a cluster is right now."""
+    if not st.ok:
+        return -1.0
+    return sum(b["jobs"] for b in st.running_by_account.values())
+
+
+def record_history(total_cpu: float, total_gpu: float) -> None:
+    HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with open(HISTORY_FILE, "a") as f:
+        f.write(f"{now},{total_cpu:.3f},{total_gpu:.3f}\n")
+    lines = HISTORY_FILE.read_text().splitlines()
+    if len(lines) > MAX_HISTORY_LINES:
+        HISTORY_FILE.write_text("\n".join(lines[-MAX_HISTORY_LINES:]) + "\n")
+
+
+def load_history(hours: float) -> list:
+    if not HISTORY_FILE.exists():
+        return []
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    out = []
+    for line in HISTORY_FILE.read_text().splitlines():
+        parts = line.split(",")
+        if len(parts) != 3:
+            continue
+        try:
+            ts = datetime.fromisoformat(parts[0])
+            cpu, gpu = float(parts[1]), float(parts[2])
+        except ValueError:
+            continue
+        if ts >= cutoff:
+            out.append((ts, cpu, gpu))
+    return out
+
+
+def _bucket_series(points: list, hours: float, n_buckets: int = 48) -> list:
+    """Average points into n_buckets time slots over the window; empty slots
+    carry forward the last known value so a sparse history still draws a line."""
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(hours=hours)
+    width = timedelta(hours=hours) / n_buckets
+    buckets: list = [[] for _ in range(n_buckets)]
+    for ts, val in points:
+        idx = min(max(int((ts - start) / width), 0), n_buckets - 1)
+        buckets[idx].append(val)
+    series, last = [], None
+    for b in buckets:
+        if b:
+            last = sum(b) / len(b)
+        series.append(last)
+    return series
+
+
+def _sparkline(series: list) -> str:
+    vals = [v for v in series if v is not None]
+    if not vals:
+        return "(not enough history yet)"
+    lo, hi = min(vals), max(vals)
+    span = hi - lo
+    chars = []
+    for v in series:
+        if v is None:
+            chars.append(" ")
+        elif span < 1e-9:
+            chars.append(BLOCKS[3])
+        else:
+            chars.append(BLOCKS[min(7, int((v - lo) / span * 7))])
+    return "".join(chars)
+
+
+def trace_lines(hours: float) -> list:
+    points = load_history(hours)
+    cpu_series = _bucket_series([(ts, cpu) for ts, cpu, _ in points], hours)
+    gpu_series = _bucket_series([(ts, gpu) for ts, _, gpu in points], hours)
+    cpu_vals = [v for v in cpu_series if v is not None]
+    gpu_vals = [v for v in gpu_series if v is not None]
+    lines = [f"  {DIM}trace, last {hours:g}h ({len(points)} samples){RESET}"]
+    lines.append(
+        f"    {GREEN}cpu {_sparkline(cpu_series)}{RESET}  "
+        f"{DIM}({min(cpu_vals, default=0):.0f} - {max(cpu_vals, default=0):.0f} core-hr/hr){RESET}"
+    )
+    lines.append(
+        f"    {ORANGE}gpu {_sparkline(gpu_series)}{RESET}  "
+        f"{DIM}({min(gpu_vals, default=0):.2f} - {max(gpu_vals, default=0):.2f}/hr){RESET}"
+    )
+    return lines
+
+
+def render_text(statuses: list, accounts: list, history_hours: float = 3.0) -> str:
+    total_cpu, total_gpu = _grand_totals(statuses)
+    rule = f"{GRAY}{'─' * 58}{RESET}"
+    lines = [
+        f"{BOLD}{PURPLE}cluster-status{RESET}  {DIM}{time.strftime('%Y-%m-%d %H:%M:%S')}{RESET}",
+        rule,
+        f"{BOLD}TOTAL{RESET}   "
+        f"cpu {BOLD}{GREEN}{total_cpu:>5.0f}{RESET} core-hr/hr   "
+        f"gpu {BOLD}{ORANGE}{total_gpu:>5.2f}{RESET}/hr {DIM}(H100-eq){RESET}",
+    ]
+    lines.extend(trace_lines(history_hours))
+
+    for st in statuses:
+        lines.append("")
+        lines.append(f"{BOLD}{CYAN}{st.name}{RESET}")
+        lines.append(f"{GRAY}{'─' * len(st.name)}{RESET}")
+        if not st.ok:
+            lines.append(f"  {RED}unreachable{RESET}: {st.error}")
+            continue
+
+        lines.append(f"  {DIM}{'account':<20} {'fairshare':>10} {'24h':>8} {'7d':>8}{RESET}")
+        for acct in accounts:
+            fs = st.fairshare.get(acct)
+            fs_s = f"{_fs_color(fs)}{fs:>10.3f}{RESET}" if fs is not None else f"{GRAY}{'-':>10}{RESET}"
+            u24 = st.usage_24h.get(acct, 0.0)
+            u7 = st.usage_7d.get(acct, 0.0)
+            lines.append(f"  {FG}{acct:<20}{RESET} {fs_s} {DIM}{u24:>8.0f} {u7:>8.0f}{RESET}")
+
+        lines.append(f"  {DIM}running now{RESET}")
+        if not st.running_by_account:
+            lines.append(f"    {GRAY}nothing running{RESET}")
+        for acct, b in st.running_by_account.items():
+            lines.append(
+                f"    {FG}{acct:<20}{RESET} {PURPLE}{b['jobs']:>3}{RESET} jobs   "
+                f"{GREEN}{b['cpus']:>4}{RESET} core-hr/hr cpu   {ORANGE}{b['gpus']:>5.2f}{RESET}/hr gpu"
+            )
+
+        groups = sorted(_group_running_jobs(st.running_jobs), key=lambda g: _job_urgency(g["worst"]), reverse=True)[:5]
+        if groups:
+            lines.append(f"  {DIM}walltime, most urgent first (bar = elapsed/limit; array jobs grouped){RESET}")
+        for g in groups:
+            j = g["worst"]
+            bar = _progress_bar(j["elapsed"] / j["limit"] if j["limit"] else None)
+            if j["limit"]:
+                pct = f"{j['elapsed'] / j['limit'] * 100:>3.0f}%"
+                used_s = f"{_fmt_dur(j['elapsed'])}/{_fmt_dur(j['limit'])}"
+            else:
+                pct = " -- "
+                used_s = f"{_fmt_dur(j['elapsed'])}/unlimited"
+            wait_s = f"{DIM}queued {_fmt_dur(j['wait'])} before start{RESET}" if j["wait"] else ""
+            lines.append(
+                f"    {DIM}{_job_kind(j):<3}{RESET} {FG}{_group_label(g):<14}{RESET} "
+                f"{bar} {pct}  {used_s:<16} {wait_s}"
+            )
+
+        lines.append(f"  {DIM}queue{RESET}  {PINK}{st.pending_count}{RESET} pending")
+        for jid, secs, reason in st.pending_etas[:5]:
+            lines.append(
+                f"    {FG}{jid:<14}{RESET} starts in "
+                f"{_eta_color(secs)}{_fmt_eta(secs):>7}{RESET}   {DIM}({reason}){RESET}"
+            )
+    return "\n".join(lines)
+
+
+def _svg_trace(series: list, color: str, width: int = 440, height: int = 50) -> str:
+    vals = [v for v in series if v is not None]
+    if len(vals) < 2:
+        return "<p><i>not enough history yet</i></p>"
+    lo, hi = min(vals), max(vals)
+    span = hi - lo or 1.0
+    n = len(series)
+    step = width / (n - 1)
+
+    segments, current = [], []
+    for i, v in enumerate(series):
+        if v is None:
+            if len(current) > 1:
+                segments.append(current)
+            current = []
+            continue
+        x = i * step
+        y = height - ((v - lo) / span) * (height - 4) - 2
+        current.append(f"{x:.1f},{y:.1f}")
+    if len(current) > 1:
+        segments.append(current)
+
+    polylines = "".join(
+        f'<polyline points="{" ".join(seg)}" fill="none" stroke="{color}" stroke-width="2"/>'
+        for seg in segments
+    )
+    return (
+        f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}">'
+        f'{polylines}</svg>'
+        f'<div class="trace-range">{lo:.2f} &ndash; {hi:.2f}</div>'
+    )
+
+
+def render_html(statuses: list, accounts: list, history_hours: float = 3.0) -> str:
+    def fs_class(v):
+        if v is None:
+            return ""
+        return "good" if v >= 0.5 else "warn" if v >= 0.2 else "bad"
+
+    def bar_html(frac, pct_txt, used_txt) -> str:
+        if frac is None:
+            fill = '<div class="bar-fill none" style="width:100%"></div>'
+        else:
+            cls = "good" if frac < 0.6 else "warn" if frac < 0.85 else "bad"
+            pct = min(max(frac, 0.0), 1.0) * 100
+            fill = f'<div class="bar-fill {cls}" style="width:{pct:.0f}%"></div>'
+        return f'<div class="bar">{fill}</div><span class="bar-label">{pct_txt} &middot; {used_txt}</span>'
+
+    total_cpu, total_gpu = _grand_totals(statuses)
+    points = load_history(history_hours)
+    cpu_series = _bucket_series([(ts, cpu) for ts, cpu, _ in points], history_hours)
+    gpu_series = _bucket_series([(ts, gpu) for ts, _, gpu in points], history_hours)
+    trace_html = f"""
+<div class="card trace">
+  <div class="trace-row"><b>cpu core-hr/hr</b> <span class="dim">last {history_hours:g}h &middot; {len(points)} samples</span>
+    {_svg_trace(cpu_series, "#a6e22e")}</div>
+  <div class="trace-row"><b>gpu/hr</b> <span class="dim">H100-eq</span>
+    {_svg_trace(gpu_series, "#fd971f")}</div>
+</div>
+"""
+
+    blocks = []
+    for st in statuses:
+        if not st.ok:
+            blocks.append(
+                f'<div class="card"><h2>{html_lib.escape(st.name)}</h2>'
+                f"<p class='bad'>unreachable: {html_lib.escape(st.error)}</p></div>"
+            )
+            continue
+        rows = []
+        for acct in accounts:
+            fs = st.fairshare.get(acct)
+            fs_txt = f"{fs:.3f}" if fs is not None else "-"
+            rows.append(
+                f"<tr><td>{html_lib.escape(acct)}</td>"
+                f"<td class='{fs_class(fs)}'>{fs_txt}</td>"
+                f"<td>{st.usage_24h.get(acct, 0.0):.0f}</td>"
+                f"<td>{st.usage_7d.get(acct, 0.0):.0f}</td></tr>"
+            )
+        running_rows = "".join(
+            f"<tr><td>{html_lib.escape(a)}</td><td>{b['jobs']}</td><td>{b['cpus']}</td><td>{b['gpus']:.2f}</td></tr>"
+            for a, b in st.running_by_account.items()
+        ) or "<tr><td colspan='4' class='dim'>nothing running</td></tr>"
+        pending_rows = "".join(
+            f"<tr><td>{html_lib.escape(jid)}</td><td>{_fmt_eta(secs)}</td><td>{html_lib.escape(reason)}</td></tr>"
+            for jid, secs, reason in st.pending_etas[:10]
+        ) or "<tr><td colspan='3' class='dim'>none</td></tr>"
+
+        groups = sorted(_group_running_jobs(st.running_jobs), key=lambda g: _job_urgency(g["worst"]), reverse=True)[:5]
+        bar_row_list = []
+        for g in groups:
+            j = g["worst"]
+            bar_row_list.append(
+                f"<tr><td><span class='tag'>{_job_kind(j)}</span>{html_lib.escape(_group_label(g))}</td>"
+                f"<td class='barcell'>"
+                + bar_html(
+                    j["elapsed"] / j["limit"] if j["limit"] else None,
+                    f"{j['elapsed'] / j['limit'] * 100:.0f}%" if j["limit"] else "--",
+                    f"{_fmt_dur(j['elapsed'])}/{_fmt_dur(j['limit']) if j['limit'] else 'unlimited'}",
+                )
+                + "</td>"
+                f"<td class='dim'>{'queued ' + _fmt_dur(j['wait']) + ' before start' if j['wait'] else ''}</td></tr>"
+            )
+        bar_rows = "".join(bar_row_list) or "<tr><td colspan='3' class='dim'>none</td></tr>"
+
+        blocks.append(f"""
+<div class="card">
+<h2>{html_lib.escape(st.name)}</h2>
+<table><tr><th>account</th><th>fairshare</th><th>24h hrs</th><th>7d hrs</th></tr>{''.join(rows)}</table>
+<h3>running now</h3>
+<table><tr><th>account</th><th>jobs</th><th>cpu (core-hr/hr)</th><th>gpu/hr (H100-eq)</th></tr>{running_rows}</table>
+<h3>walltime, most urgent first (array jobs grouped)</h3>
+<table class="bars"><tr><th>job</th><th>elapsed / limit</th><th>wait</th></tr>{bar_rows}</table>
+<h3>queue ({st.pending_count} pending)</h3>
+<table><tr><th>job</th><th>eta</th><th>reason</th></tr>{pending_rows}</table>
+</div>
+""")
+
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>cluster status</title>
+<style>
+:root {{
+  --bg: #272822; --bg2: #2d2e27; --fg: #f8f8f2; --dim: #75715e;
+  --cyan: #66d9ef; --green: #a6e22e; --purple: #ae81ff;
+  --orange: #fd971f; --red: #f92672; --border: #49483e;
+}}
+* {{ box-sizing: border-box; }}
+body {{
+  font-family: -apple-system, "Segoe UI", sans-serif; margin: 0; padding: 2em;
+  background: var(--bg); color: var(--fg);
+}}
+h1, h2, h3 {{ margin: 0 0 0.6em 0; font-weight: 600; }}
+h2 {{ color: var(--cyan); }}
+h3 {{ color: var(--dim); font-size: 0.8em; text-transform: uppercase; letter-spacing: 0.04em; margin-top: 1.2em; }}
+.dim {{ color: var(--dim); }}
+.card {{
+  background: var(--bg2); border-radius: 10px; padding: 1.2em 1.4em;
+  margin-bottom: 1.2em; box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+}}
+.header {{ display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 1em; }}
+.header h1 {{ color: var(--purple); font-size: 1.3em; margin: 0; }}
+.totals {{ display: flex; gap: 2em; font-size: 1.1em; }}
+.stat {{ font-weight: 700; }}
+.stat.cpu {{ color: var(--green); }}
+.stat.gpu {{ color: var(--orange); }}
+table {{ border-collapse: collapse; width: 100%; font-size: 0.92em; }}
+td, th {{ padding: 4px 10px; text-align: right; border-bottom: 1px solid var(--border); }}
+th, td:first-child {{ text-align: left; color: var(--dim); font-weight: 500; }}
+td:first-child {{ color: var(--fg); }}
+.good {{ color: var(--green); font-weight: 600; }}
+.warn {{ color: var(--orange); font-weight: 600; }}
+.bad {{ color: var(--red); font-weight: 600; }}
+.trace-row {{ margin-bottom: 1em; }}
+.trace-row:last-child {{ margin-bottom: 0; }}
+.trace-row svg {{ display: block; margin-top: 0.3em; }}
+.trace-range {{ font-size: 0.8em; color: var(--dim); }}
+table.bars td {{ text-align: left; border-bottom: 1px solid var(--border); }}
+.barcell {{ display: flex; align-items: center; gap: 0.7em; }}
+.bar {{ flex: 0 0 140px; height: 8px; border-radius: 4px; background: var(--border); overflow: hidden; }}
+.bar-fill {{ height: 100%; }}
+.bar-fill.good {{ background: var(--green); }}
+.bar-fill.warn {{ background: var(--orange); }}
+.bar-fill.bad {{ background: var(--red); }}
+.bar-fill.none {{ background: var(--border); }}
+.bar-label {{ font-size: 0.85em; white-space: nowrap; color: var(--fg); }}
+.tag {{
+  display: inline-block; font-size: 0.7em; color: var(--dim); border: 1px solid var(--border);
+  border-radius: 4px; padding: 1px 5px; margin-right: 8px; vertical-align: 1px;
+}}
+</style></head>
+<body>
+<div class="header">
+  <h1>cluster-status</h1>
+  <div class="dim">generated {time.strftime('%Y-%m-%d %H:%M:%S')}</div>
+</div>
+<div class="card totals">
+  <div><span class="dim">TOTAL</span> &nbsp; cpu <span class="stat cpu">{total_cpu:.0f} core-hr/hr</span></div>
+  <div>gpu <span class="stat gpu">{total_gpu:.2f}/hr</span> <span class="dim">(H100-eq)</span></div>
+</div>
+{trace_html}
+{''.join(blocks)}
+</body></html>"""
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--clusters", nargs="+", default=DEFAULT_CLUSTERS)
+    ap.add_argument("--accounts", nargs="+", default=DEFAULT_ACCOUNTS)
+    ap.add_argument("--html", metavar="PATH", help="also write a static HTML snapshot")
+    ap.add_argument("--watch", type=int, metavar="SECONDS", help="refresh in a loop")
+    ap.add_argument("--history-hours", type=float, default=3.0, help="trace window (default 3h)")
+    ap.add_argument("--no-record", action="store_true", help="don't log this run into the trace history")
+    args = ap.parse_args()
+
+    def one_pass():
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(args.clusters)) as ex:
+            statuses = list(ex.map(lambda h: fetch_cluster(h, args.accounts), args.clusters))
+        statuses.sort(key=_cluster_load, reverse=True)
+        if not args.no_record:
+            record_history(*_grand_totals(statuses))
+        print(render_text(statuses, args.accounts, args.history_hours))
+        if args.html:
+            with open(args.html, "w") as f:
+                f.write(render_html(statuses, args.accounts, args.history_hours))
+            print(f"\n  wrote {args.html}")
+
+    if args.watch:
+        try:
+            while True:
+                print("\033[H\033[J", end="")  # clear screen
+                one_pass()
+                time.sleep(args.watch)
+        except KeyboardInterrupt:
+            sys.exit(0)
+    else:
+        one_pass()
+
+
+if __name__ == "__main__":
+    main()
